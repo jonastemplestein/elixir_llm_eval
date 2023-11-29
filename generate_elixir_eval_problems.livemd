@@ -1,0 +1,571 @@
+<!-- livebook:{"file_entries":[{"name":"HumanEval.jsonl","type":"attachment"}]} -->
+
+# Generate Elixir HumanEval Problems
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.11.0"},
+  {:jason, "~> 1.4"},
+  {:openai_ex, "~> 0.4.2"}
+])
+
+apikey = System.fetch_env!("LB_OPENAI_API_KEY")
+openai = OpenaiEx.new(apikey)
+```
+
+## Scratchpad
+
+```elixir
+defmodule Encoder do
+  def encode_shift(s) do
+    s
+    |> String.to_charlist()
+    |> Enum.map(&(rem(&1 + 5 - ?a, 26) + ?a))
+    |> to_string()
+  end
+end
+
+Encoder.encode_shift("zab")
+```
+
+## Prep
+
+### Goals
+
+* We want to be able to evaluate the performance of LLMs for code generation
+* Ability to semi-automatically translate existing benchmarks such as human-eval, human-eval-infilling, MBPP, MBXP, DS-1000, HumanEval-X, HumanEval-multilingual and others into Elixir
+* Evaluate several state of the art models' Elixir performance
+* Ability to add our own Elixir evaluation tasks in future
+* Evaluation needs to be fast so we can run it occasionally during training to see if a training run is going in the right direction
+
+### In this notebook we'll do the following
+
+1. Define a new data format for Elixir evaluation tasks that is a superset of existing evaluation benchmarks (so we can translate from a wide range of benchmarks). Each task consists of
+
+* `id` - A human-readable unique ID
+* `code_context_mix_setup` - A `Mix.install` block
+  * Important to test if models are dependency-aware and for later evaluating models that are e.g. fine-tuned on common livebook workflows.
+  * Separated out so we can install all dependencies at once if we like
+* `code_context_before` - code before our implementation, generally consists of
+  * Helper functions that can be used in the solution (if any - mostly empty)
+  * A module definition
+  * The docstring
+  * The function head
+  * The beginning of the implementation
+* `code_context_after` - Any code after the implementation - only used for infilling tasks
+* `canonical_solution` - The canonical solution
+* `surface_level_conditions` - Will in future be used to test _how_ somethign was implemented (e.g. to check whether a pipe was used or not).
+* `tests` - Tests to confirm the solution works as intended
+* `description` - Field for human readable description or comments about specific tasks - the LLMs won't see this
+
+1. Convert existing benchmarks into this new format and save as `.jsonl` files
+
+2. Produce an Evaluator module that can check generated solution samples against the tests
+
+* Load sample solutions from `.jsonl` file (can have many samples for each task ID)
+* Evaluate samples against tests and return pass-rate for each task ID, as well as overall pass@k metric for various values of `k`
+
+```elixir
+defmodule EvalTask do
+  defstruct [
+    :id,
+    :description,
+    :code_context_mix_setup,
+    :code_context_before,
+    :code_context_after,
+    :tests,
+    :surface_level_conditions,
+    :canonical_solution
+  ]
+end
+```
+
+````elixir
+defmodule Helper do
+  def show_human_eval_tasks(tasks) do
+    show_human_eval_tasks(tasks, 0, Kino.Frame.new())
+  end
+
+  def show_human_eval_tasks(tasks, i, frame) do
+    previous_button = Kino.Control.button("Previous")
+    next_button = Kino.Control.button("Next")
+
+    Kino.listen(previous_button, fn _event ->
+      Kino.Frame.clear(frame)
+      show_human_eval_tasks(tasks, max(i - 1, 0), frame)
+    end)
+
+    Kino.listen(next_button, fn _event ->
+      Kino.Frame.clear(frame)
+
+      show_human_eval_tasks(tasks, min(i + 1, length(tasks) - 1), frame)
+    end)
+
+    Kino.Frame.clear(frame)
+
+    task = Enum.at(tasks, i)
+
+    Kino.Frame.append(
+      frame,
+      Kino.Layout.grid([
+        Kino.Layout.grid(
+          [previous_button, Kino.Shorts.text("Task #{i + 1}/#{length(tasks)}"), next_button],
+          columns: 3
+        ),
+        show_human_eval_task(task)
+      ])
+    )
+
+    frame
+  end
+
+  def show_human_eval_task(task) do
+    Kino.Layout.grid(
+      [
+        Kino.Shorts.markdown("""
+          ## Task: #{task["task_id"]} 
+          ### Prompt: 
+          ```python
+          #{task["prompt"]}
+          ```
+        """),
+        Kino.Shorts.markdown("""
+          ### Canonical Solution: 
+          ```python
+          #{task["canonical_solution"]}
+          ```
+        """),
+        Kino.Shorts.markdown("""
+          ### Test: 
+          ```python
+          #{task["test"]}
+          ```
+        """)
+      ],
+      columns: 1,
+      boxed: true
+    )
+  end
+
+  def show_tasks(tasks) do
+    show_tasks(tasks, 0, Kino.Frame.new())
+  end
+
+  def show_tasks(tasks, i, frame) do
+    previous_button = Kino.Control.button("Previous")
+    next_button = Kino.Control.button("Next")
+
+    Kino.listen(previous_button, fn _event ->
+      Kino.Frame.clear(frame)
+      show_tasks(tasks, max(i - 1, 0), frame)
+    end)
+
+    Kino.listen(next_button, fn _event ->
+      Kino.Frame.clear(frame)
+
+      show_tasks(tasks, min(i + 1, length(tasks) - 1), frame)
+    end)
+
+    Kino.Frame.clear(frame)
+
+    task = Enum.at(tasks, i)
+
+    Kino.Frame.append(
+      frame,
+      Kino.Layout.grid([
+        Kino.Layout.grid(
+          [previous_button, Kino.Shorts.text("Task #{i + 1}/#{length(tasks)}"), next_button],
+          columns: 3
+        ),
+        show_task(task)
+      ])
+    )
+
+    frame
+  end
+
+  def show_task(%EvalTask{} = task) do
+    Kino.Layout.grid(
+      [
+        Kino.Shorts.markdown("""
+        ## Elixir Eval Task: #{task.id} 
+        ### Code Context Before:
+        ```elixir
+        #{task.code_context_before}
+        ```
+        """),
+        Kino.Shorts.markdown("""
+          ### Canonical Solution: 
+          ```elixir
+          #{task.canonical_solution}
+          ```
+        """),
+        Kino.Shorts.markdown("""
+        ### Tests: 
+        ```elixir
+        #{task.tests}
+        ```
+        """)
+      ],
+      columns: 1,
+      boxed: true
+    )
+  end
+end
+````
+
+## HumanEval
+
+First we load the HumanEval dataset
+
+```elixir
+human_eval_tasks =
+  Kino.FS.file_path("HumanEval.jsonl")
+  |> File.stream!()
+  |> Stream.map(&Jason.decode!/1)
+  |> Enum.to_list()
+
+hd(human_eval_tasks)
+```
+
+```elixir
+Helper.show_human_eval_tasks(human_eval_tasks)
+```
+
+We'll now do some sanity checks to see how best to convert the tasks to Elixir.
+
+```elixir
+human_eval_tasks
+|> Enum.map(&String.split(&1["prompt"], "\"\"\""))
+|> Enum.map(&length/1)
+|> Enum.frequencies()
+```
+
+Okay, so it looks like there are 142 tasks that just have one docstring that are easy to parse. Let's look at the others
+
+```elixir
+strange_tasks =
+  human_eval_tasks
+  |> Enum.filter(
+    &(length(String.split(&1["prompt"], "\"\"\"")) != 3 &&
+        length(String.split(&1["prompt"], "'''")) != 3)
+  )
+
+Helper.show_human_eval_tasks(strange_tasks)
+```
+
+Okay, looks like the 17 tasks without """ simply use ''' - no problem there.
+
+Four of the five tasks with four sets of triple-quotes have a helper method that is defined _before_ the main function docstring. This means we can simply use the contents of the last docstring in the task prompt. We will, however, have to translate those helper methods to Elixir.
+
+The final one, HumanEval/64 has a docstring at the top called FIX that indicates that the authors of HumanEval needed to add more test cases 🤣
+
+We can manually fix the five weird tests and now build a struct that can translate human-eval tasks to Elixir
+
+Then we'll
+
+* Build evaluation harness to run tests against a sample solution
+
+* Prompt GPT4 to generate `n` sample solutions for each task
+
+* Evaluate GPT4's pass@k metric for k << n
+
+* If GPT4 does really well, we can probably use a passing solution as canonical solution. If not, maybe we try asking GPT4 to translate from python for the failing ones. We can also manually fix badly done canonical solutions later on
+
+```elixir
+defmodule HumanEval do
+  @doc """
+  human-eval tasks have the fields 
+    - "task_id" => "HumanEval/0",
+    - "canonical_solution" => "    for idx, elem in enumerate(numbers):\n..."
+    - "entry_point" => "has_close_elements"
+    - "prompt" => "from typing import List\n\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n",
+    - "test" => "..."
+
+  """
+  def to_elixir_task(task) do
+    %EvalTask{
+      id: task["task_id"],
+      code_context_mix_setup: "",
+      code_context_before: code_context(task),
+      code_context_after: "",
+      tests: tests(task),
+      surface_level_conditions: ""
+    }
+  end
+
+  def code_context(task) do
+    """
+    defmodule #{module_name(task)} do
+    #{helper_methods(task)}
+      @doc ~s\"\"\"
+      #{docstring(task)}
+      \"\"\"
+      #{function_head(task)}
+    """
+  end
+
+  @doc ~s"""
+  Four human-eval tasks have helper methods that we've manually translated
+  """
+  def helper_methods(task) do
+    case task["task_id"] do
+      #  def is_palindrome(string: str) -> bool:
+      #    """ Test if given string is a palindrome """
+      #    return string == string[::-1]
+      "HumanEval/10" ->
+        ~c"""
+          @doc \"""
+          Test if given string is a palindrome
+          \"""
+          def is_palindrome(string), do: String.reverse(string) == string
+        """
+
+      # def poly(xs: list, x: float):
+      #   """
+      #   Evaluates polynomial with coefficients xs at point x.
+      #   return xs[0] + xs[1] * x + xs[1] * x^2 + .... xs[n] * x^n
+      #   """
+      #   return sum([coeff * math.pow(x, i) for i, coeff in enumerate(xs)])
+      "HumanEval/32" ->
+        ~c"""
+          @doc \"""
+          Evaluates polynomial with coefficients xs at point x.
+          return xs[0] + xs[1] * x + xs[1] * x^2 + .... xs[n] * x^n
+          \"""
+          def poly(xs, x) do
+            xs
+            |> Enum.with_index()
+            |> Enum.reduce(0, fn {coeff, i}, acc -> acc + coeff * :math.pow(x, i) end)
+          end
+        """
+
+      # def encode_cyclic(s: str):
+      #   """
+      #   returns encoded string by cycling groups of three characters.
+      #   """
+      #   # split string to groups. Each of length 3.
+      #   groups = [s[(3 * i):min((3 * i + 3), len(s))] for i in range((len(s) + 2) // 3)]
+      #   # cycle elements in each group. Unless group has fewer elements than 3.
+      #   groups = [(group[1:] + group[0]) if len(group) == 3 else group for group in groups]
+      #   return "".join(groups)
+      "HumanEval/38" ->
+        ~c"""
+          @doc \"""
+          returns encoded string by cycling groups of three characters.
+          \"""
+          def encode_cyclic(s) do
+            s
+            |> String.graphemes()
+            |> Enum.chunk_every(3)
+            |> Enum.map(fn
+              [a, b, c] -> [b, c, a]
+              [a, b] -> [a, b]
+              [a] -> [a]
+            end)
+            |> List.flatten()
+            |> Enum.join()
+          end
+        """
+
+      # def encode_shift(s: str):
+      # """
+      # returns encoded string by shifting every character by 5 in the alphabet.
+      # """
+      # return "".join([chr(((ord(ch) + 5 - ord("a")) % 26) + ord("a")) for ch in s])  
+      "HumanEval/50" ->
+        ~c"""
+          @doc \"""
+          returns encoded string by shifting every character by 5 in the alphabet.
+          \"""
+          def encode_shift(s) do
+            s
+            |> String.to_charlist()
+            |> Enum.map(&((rem((&1 + 5 - ?a), 26)) + ?a))
+            |> to_string()
+          end
+        """
+
+      _ ->
+        ""
+    end
+  end
+
+  def module_name(task), do: task["task_id"] |> String.replace("/", "")
+
+  @doc ~s"""
+  Generates the elixir function head for this task. Here's what they look like
+
+  def rolling_max(numbers: List[int]) -> List[int]:
+  def make_palindrome(string: str) -> str:
+  def concatenate(strings: List[str]) -> str:
+  def change_base(x: int, base: int):
+
+  We need to remove the type information and replace everything after the parenthesis with ` do`
+
+  TODO: Generate elixir typespecs
+
+  """
+  def function_head(task) do
+    params_pattern = ~r/def .+\((.*?)\)( -> .+)?:/
+
+    python_function_head =
+      task["prompt"]
+      |> String.split("\n")
+      |> Enum.find(&String.contains?(&1, "def #{task["entry_point"]}"))
+
+    IO.puts(task["task_id"])
+    IO.puts(python_function_head)
+
+    params =
+      python_function_head
+      # this is row with python function head
+      |> String.replace(params_pattern, "\\1")
+      # now just the comma-separated params with optional type info
+      |> String.split(", ")
+      # [["a", "int"], ["b", "int"]]
+      |> Enum.map(&String.split(&1, ": "))
+      |> Enum.map(&hd/1)
+      |> Enum.join(", ")
+
+    result = "def #{function_name(task)}(#{params}) do"
+    IO.puts(result)
+    result
+  end
+
+  @doc ~s"""
+  The python docstrings are indented two spaces so we need to fix that
+
+  TODO: turn examples into doctests (problem is they come in a number of different formats)
+  """
+  def docstring(task) do
+    case String.split(task["prompt"], "\"\"\"") do
+      [_, docstring, _] -> docstring
+      # 5/164 cases have a second docstring
+      [_, _helper_docstring, _helper_impl, docstring, _] -> docstring
+      # some tasks use single backticks (but none of those have a helper function)
+      [prompt] -> String.split(prompt, "'''") |> Enum.at(1)
+    end
+    |> String.replace("\n  ", "\n")
+  end
+
+  @doc """
+  The human eval dataset isn't super clean. There are some camel case and capitalised names in there
+  """
+  def function_name(task) do
+    task["entry_point"]
+    |> String.replace(~r/[A-Z]/, fn match -> "_" <> String.downcase(match) end)
+    |> String.trim_leading("_")
+  end
+
+  def tests(task), do: task["test"]
+end
+```
+
+```elixir
+task = human_eval_tasks |> Enum.map(&HumanEval.function_head/1)
+```
+
+```elixir
+elixir_eval_tasks = human_eval_tasks |> Enum.map(&HumanEval.to_elixir_task/1)
+
+Helper.show_tasks(elixir_eval_tasks)
+```
+
+Let's do some sanity checking - all code should compile if we add two ends to it
+
+```elixir
+compilable_elixir =
+  elixir_eval_tasks |> Enum.map(& &1.code_context_before) |> Enum.map(&(&1 <> "\n  end\nend\n"))
+
+compilable_elixir
+|> Enum.with_index()
+|> Enum.each(fn
+  {elixir, i} ->
+    IO.puts(i)
+    Code.eval_string(elixir)
+end)
+```
+
+## Generate samples with GPT4
+
+````elixir
+alias OpenaiEx.ChatCompletion
+alias OpenaiEx.ChatMessage
+alias OpenaiEx.MsgContent
+
+task = Enum.random(human_eval_tasks)
+
+prompt = """
+Translate this python code into Elixir.
+Place the Elixir function #{task["entry_point"]} in a module called Test01.
+Don't change the function signature. 
+No need to use typespecs.
+Only respond with the Elixir code. 
+Only use functions that actually exist in Elixir.
+Don't just assume something that exists in python will exist in Elixir.
+Important: Convert the python docstrings (the ones with the triple-quotes) into Elixir 
+Ignore the python imports.
+
+Here is an example of a successful conversion:
+
+Python prompt
+
+
+
+
+```python
+#{task["prompt"]}
+#{task["canonical_solution"]}
+```
+"""
+
+IO.puts(prompt)
+
+chat_req =
+  ChatCompletion.new(
+    model: "gpt-4-1106-preview",
+    messages: [
+      ChatMessage.user(prompt)
+    ]
+  )
+
+chat_response = openai |> ChatCompletion.create(chat_req)
+
+Kino.Shorts.markdown("""
+#{chat_response["choices"] |> hd |> Map.get("message") |> Map.get("content")}
+""")
+````
+
+```elixir
+defmodule Test01 do
+  def encode(message) do
+    """
+    Write a function that takes a message, and encodes in such a way that it swaps case of all letters, replaces all vowels in
+    the message with the letter that appears 2 places ahead of that vowel in the english alphabet.
+    Assume only letters.
+
+    ## Examples
+
+        iex> Test01.encode('test')
+        'TGST'
+
+        iex> Test01.encode('This is a message')
+        'tHKS KS C MGSSCGG'
+    """
+
+    vowels = "aeiouAEIOU"
+    vowels_replace = for <<vowel <- vowels>>, into: %{}, do: {vowel, <<vowel + 2>>}
+
+    message
+    |> String.swapcase()
+    |> String.to_charlist()
+    |> Enum.map(&if vowels_replace[&1], do: vowels_replace[&1], else: &1)
+    |> List.to_string()
+  end
+end
+
+Test01.encode(~c"This is a message")
+```
+
+<!-- livebook:{"offset":16190,"stamp":{"token":"XCP.MeJgaQKsdxLrL1l3i_LqtW-8Kt2hA5lgAeP3d-oJovRPvpd11xt1ePnGbe3ByWzfcSeSb0hPptE_ND0g2qzDJ4MAi0YaSRNl7r7itNNkL2fyUmiZIDqQdMg","version":2}} -->
