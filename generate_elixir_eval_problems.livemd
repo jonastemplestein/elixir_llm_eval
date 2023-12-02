@@ -1,5 +1,3 @@
-<!-- livebook:{"file_entries":[{"name":"HumanEval.jsonl","type":"attachment"}]} -->
-
 # Generate Elixir HumanEval Problems
 
 ```elixir
@@ -16,16 +14,7 @@ openai = OpenaiEx.new(apikey)
 ## Scratchpad
 
 ```elixir
-defmodule Encoder do
-  def encode_shift(s) do
-    s
-    |> String.to_charlist()
-    |> Enum.map(&(rem(&1 + 5 - ?a, 26) + ?a))
-    |> to_string()
-  end
-end
 
-Encoder.encode_shift("zab")
 ```
 
 ## Prep
@@ -66,7 +55,7 @@ Encoder.encode_shift("zab")
 * Evaluate samples against tests and return pass-rate for each task ID, as well as overall pass@k metric for various values of `k`
 
 ```elixir
-defmodule EvalTask do
+defmodule ElixirEval.Task do
   defstruct [
     :id,
     :description,
@@ -77,6 +66,46 @@ defmodule EvalTask do
     :surface_level_conditions,
     :canonical_solution
   ]
+end
+
+defmodule ElixirEval.Sample do
+  defstruct [
+    :task_id,
+    :sample_id,
+    :completion
+  ]
+end
+
+defmodule ElixirEval do
+  def save_tasks!(tasks, path) do
+    File.write!(
+      path,
+      tasks |> Enum.map(&Map.from_struct/1) |> Enum.map(&Jason.encode!/1) |> Enum.join("\n")
+    )
+  end
+
+  def load_tasks!(path) do
+    path
+    |> File.stream!()
+    |> Stream.map(&Jason.decode!(&1, keys: :atoms))
+    |> Stream.map(&struct(ElixirEval.Task, &1))
+    |> Enum.to_list()
+  end
+
+  def save_samples!(tasks, path) do
+    File.write!(
+      path,
+      tasks |> Enum.map(&Map.from_struct/1) |> Enum.map(&Jason.encode!/1) |> Enum.join("\n")
+    )
+  end
+
+  def load_samples!(path) do
+    path
+    |> File.stream!()
+    |> Stream.map(&Jason.decode!(&1, keys: :atoms))
+    |> Stream.map(&struct(ElixirEval.Sample, &1))
+    |> Enum.to_list()
+  end
 end
 ```
 
@@ -184,7 +213,7 @@ defmodule Helper do
     frame
   end
 
-  def show_task(%EvalTask{} = task) do
+  def show_task(%ElixirEval.Task{} = task) do
     Kino.Layout.grid(
       [
         Kino.Shorts.markdown("""
@@ -214,13 +243,13 @@ defmodule Helper do
 end
 ````
 
-## HumanEval
+## Convert HumanEval to Elixir Tasks
 
 First we load the HumanEval dataset
 
 ```elixir
 human_eval_tasks =
-  Kino.FS.file_path("HumanEval.jsonl")
+  Path.join(__DIR__, "files/source_benchmarks/HumanEval.jsonl")
   |> File.stream!()
   |> Stream.map(&Jason.decode!/1)
   |> Enum.to_list()
@@ -251,7 +280,7 @@ strange_tasks =
         length(String.split(&1["prompt"], "'''")) != 3)
   )
 
-Helper.show_human_eval_tasks(strange_tasks)
+# Helper.show_human_eval_tasks(strange_tasks)
 ```
 
 Okay, looks like the 17 tasks without """ simply use ''' - no problem there.
@@ -284,17 +313,17 @@ defmodule HumanEval do
 
   """
   def to_elixir_task(task) do
-    %EvalTask{
+    %ElixirEval.Task{
       id: task["task_id"],
       code_context_mix_setup: "",
-      code_context_before: code_context(task),
+      code_context_before: code_context_before(task),
       code_context_after: "",
       tests: tests(task),
       surface_level_conditions: ""
     }
   end
 
-  def code_context(task) do
+  def code_context_before(task) do
     """
     defmodule #{module_name(task)} do
     #{helper_methods(task)}
@@ -409,16 +438,10 @@ defmodule HumanEval do
   def function_head(task) do
     params_pattern = ~r/def .+\((.*?)\)( -> .+)?:/
 
-    python_function_head =
+    params =
       task["prompt"]
       |> String.split("\n")
       |> Enum.find(&String.contains?(&1, "def #{task["entry_point"]}"))
-
-    IO.puts(task["task_id"])
-    IO.puts(python_function_head)
-
-    params =
-      python_function_head
       # this is row with python function head
       |> String.replace(params_pattern, "\\1")
       # now just the comma-separated params with optional type info
@@ -428,9 +451,7 @@ defmodule HumanEval do
       |> Enum.map(&hd/1)
       |> Enum.join(", ")
 
-    result = "def #{function_name(task)}(#{params}) do"
-    IO.puts(result)
-    result
+    "def #{function_name(task)}(#{params}) do"
   end
 
   @doc ~s"""
@@ -458,114 +479,705 @@ defmodule HumanEval do
     |> String.trim_leading("_")
   end
 
-  def tests(task), do: task["test"]
+  def tests(task) do
+    """
+    defmodule #{module_name(task)}Test do
+      import ExUnit.Assertions
+
+      def run_tests() do
+        #{test_assertions(task)}
+      end
+    end
+    """
+  end
+
+  @doc """
+  Returns the actual elixir code. All python tests have some metadata on top (which we discard)
+  and then start with 
+
+  def  check(candidate):
+
+  Followed in most cases by either assertions or comments.
+
+  A very small number of human eval tasks have additional bespoke code.
+
+  We need to
+
+  - fix a small number of tests that aren't just a list of assertions and comments
+  - support two different styles of comments
+  - replace single quotes with double qoutes
+  - fix exponential notation (1e-6 in python and 1.0e-6 in elixir)
+  - turn python tuples into elixir tuples (e.g. in sum_product([1, 2, 3, 4]) == (10, 24))
+
+  """
+  def test_assertions(%{"task_id" => "HumanEval/32"}) do
+    # For some reason this task has non-deterministic, randomly generated tests:
+    #
+    # import math
+    # import random
+    # rng = random.Random(42)
+    # import copy
+    # for _ in range(100):
+    #     ncoeff = 2 * rng.randint(1, 4)
+    #     coeffs = []
+    #     for _ in range(ncoeff):
+    #         coeff = rng.randint(-10, 10)
+    #         if coeff == 0:
+    #             coeff = 1
+    #         coeffs.append(coeff)
+    #     solution = HumanEval32.find_zero(copy.deepcopy(coeffs))
+    #     assert math.fabs(poly(coeffs, solution)) < 1.0e-4
+    """
+    :rand.seed(:exsplus, {42, 42, 42})
+    for _ <- 1..100 do
+      coeffs = for _ <- 1..(2 * Enum.random(1..4)), do: Enum.random(-10..10)
+      solution = HumanEval32.find_zero(coeffs)
+      assert abs(HumanEval32.poly(coeffs, solution) < 1.0e-4)
+    end
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/33"}) do
+    # This one looks a bit funny - is just faster to hand-roll it
+    # def check(candidate):
+    #   assert tuple(candidate([1, 2, 3])) == tuple(sort_third([1, 2, 3]))
+    #   assert tuple(candidate([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10])) == tuple(sort_third([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10]))
+    #   assert tuple(candidate([5, 8, -12, 4, 23, 2, 3, 11, 12, -10])) == tuple(sort_third([5, 8, -12, 4, 23, 2, 3, 11, 12, -10]))
+    #   assert tuple(candidate([5, 6, 3, 4, 8, 9, 2])) == tuple([2, 6, 3, 4, 8, 9, 5])
+    #   assert tuple(candidate([5, 8, 3, 4, 6, 9, 2])) == tuple([2, 8, 3, 4, 6, 9, 5])
+    #   assert tuple(candidate([5, 6, 9, 4, 8, 3, 2])) == tuple([2, 6, 9, 4, 8, 3, 5])
+    #   assert tuple(candidate([5, 6, 3, 4, 8, 9, 2, 1])) == tuple([2, 6, 3, 4, 8, 9, 5, 1])
+    """
+    assert HumanEval33.sort_third([1, 2, 3]) == HumanEval33.sort_third([1, 2, 3])
+    assert HumanEval33.sort_third([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10]) == HumanEval33.sort_third([5, 3, -5, 2, -3, 3, 9, 0, 123, 1, -10])
+    assert HumanEval33.sort_third([5, 8, -12, 4, 23, 2, 3, 11, 12, -10]) == HumanEval33.sort_third([5, 8, -12, 4, 23, 2, 3, 11, 12, -10])
+    assert HumanEval33.sort_third([5, 6, 3, 4, 8, 9, 2]) == [2, 6, 3, 4, 8, 9, 5]
+    assert HumanEval33.sort_third([5, 8, 3, 4, 6, 9, 2]) == [2, 8, 3, 4, 6, 9, 5]
+    assert HumanEval33.sort_third([5, 6, 9, 4, 8, 3, 2]) == [2, 6, 9, 4, 8, 3, 5]
+    assert HumanEval33.sort_third([5, 6, 3, 4, 8, 9, 2, 1]) == [2, 6, 3, 4, 8, 9, 5, 1]
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/38"}) do
+    # from random import randint, choice
+    # import string
+
+    # letters = string.ascii_lowercase
+    # for _ in range(100):
+    #     str = "".join(choice(letters) for i in range(randint(10, 20)))
+    #     encoded_str = encode_cyclic(str)
+    #     assert candidate(encoded_str) == str
+    """
+    :rand.seed(:exsplus, {42, 42, 42})
+    for _ <- 1..100 do
+      str = List.duplicate(0, Enum.random(10..20)) 
+        |> Enum.map(fn _ -> Enum.random(?a..?z) end) 
+        |> to_string()
+      assert HumanEval38.encode_cyclic(HumanEval38.encode_cyclic(str)) == str
+    end
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/44"}) do
+    """
+    assert HumanEval44.change_base(8, 3) == "22"
+    assert HumanEval44.change_base(9, 3) == "100"
+    assert HumanEval44.change_base(234, 2) == "11101010"
+    assert HumanEval44.change_base(16, 2) == "10000"
+    assert HumanEval44.change_base(8, 2) == "1000"
+    assert HumanEval44.change_base(7, 2) == "111"
+    for x <- 2..8 do
+      assert HumanEval44.change_base(x, x + 1) == Integer.to_string(x)
+    end
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/50"}) do
+    # from random import randint, choice
+    # import copy
+    # import string
+
+    # letters = string.ascii_lowercase
+    # for _ in range(100):
+    #     str = "".join(choice(letters) for i in range(randint(10, 20)))
+    #     encoded_str = encode_shift(str)
+    #     assert candidate(copy.deepcopy(encoded_str)) == str
+
+    """
+    :rand.seed(:exsplus, {42, 42, 42})
+    for _ <- 1..100 do
+      random_string = for _ <- 1..Enum.random(10..20), into: "", do: <<Enum.random(?a..?z)>>
+      assert HumanEval50.decode_shift(HumanEval50.encode_shift(random_string)) == random_string
+    end
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/53"}) do
+    # assert HumanEval53.add(0, 1) == 1
+    # assert HumanEval53.add(1, 0) == 1
+    # assert HumanEval53.add(2, 3) == 5
+    # assert HumanEval53.add(5, 7) == 12
+    # assert HumanEval53.add(7, 5) == 12
+
+    # for i in range(100):
+    #     x, y = random.randint(0, 1000), random.randint(0, 1000)
+    #     assert HumanEval53.add(x, y) == x + y
+    """
+    assert HumanEval53.add(0, 1) == 1
+    assert HumanEval53.add(1, 0) == 1
+    assert HumanEval53.add(2, 3) == 5
+    assert HumanEval53.add(5, 7) == 12
+    assert HumanEval53.add(7, 5) == 12
+
+    :rand.seed(:exsplus, {42, 42, 42})
+    for _ <- 1..100 do
+      {x, y} = {Enum.random(0, 1000), Enum.random(0, 1000)}
+      assert HumanEval53.add(x, y) == x + y
+    end
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/87"}) do
+    """
+    # Check some simple cases
+    assert HumanEval87.get_row([
+        [1,2,3,4,5,6],
+        [1,2,3,4,1,6],
+        [1,2,3,4,5,1]
+    ], 1) == [{0, 0}, {1, 4}, {1, 0}, {2, 5}, {2, 0}]
+    assert HumanEval87.get_row([
+        [1,2,3,4,5,6],
+        [1,2,3,4,5,6],
+        [1,2,3,4,5,6],
+        [1,2,3,4,5,6],
+        [1,2,3,4,5,6],
+        [1,2,3,4,5,6]
+    ], 2) == [{0, 1}, {1, 1}, {2, 1}, {3, 1}, {4, 1}, {5, 1}]
+    assert HumanEval87.get_row([
+        [1,2,3,4,5,6],
+        [1,2,3,4,5,6],
+        [1,1,3,4,5,6],
+        [1,2,1,4,5,6],
+        [1,2,3,1,5,6],
+        [1,2,3,4,1,6],
+        [1,2,3,4,5,1]
+    ], 1) == [{0, 0}, {1, 0}, {2, 1}, {2, 0}, {3, 2}, {3, 0}, {4, 3}, {4, 0}, {5, 4}, {5, 0}, {6, 5}, {6, 0}]
+    assert HumanEval87.get_row([], 1) == []
+    assert HumanEval87.get_row([[1]], 2) == []
+    assert HumanEval87.get_row([[], [1], [1, 2, 3]], 3) == [{2, 2}]
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/95"}) do
+    """
+    assert HumanEval95.check_dict_case(%{"p" => "pineapple", "b" => "banana"}) == True
+    assert HumanEval95.check_dict_case(%{"p" => "pineapple", "A" => "banana", "B" => "banana"}) == False
+    assert HumanEval95.check_dict_case(%{"p" => "pineapple", 5 => "banana", "a" => "apple"}) == False
+    assert HumanEval95.check_dict_case(%{"Name" => "John", "Age" => "36", "City" => "Houston"}) == False
+    assert HumanEval95.check_dict_case(%{"STATE" => "NC", "ZIP" => "12345" }) == True
+    assert HumanEval95.check_dict_case(%{"fruit" => "Orange", "taste" => "Sweet" }) == True
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/111"}) do
+    """
+    # Check some simple cases
+    assert HumanEval111.histogram("a b b a") == %{"a" => 2,"b" => 2}
+    assert HumanEval111.histogram("a b c a b") == %{"a" => 2, "b" => 2}
+    assert HumanEval111.histogram("a b c d g") == %{"a" => 1, "b" => 1, "c" => 1, "d" => 1, "g" => 1}
+    assert HumanEval111.histogram("r t g") == %{"r" => 1,"t" => 1,"g" => 1}
+    assert HumanEval111.histogram("b b b b a") == %{"b" => 4}
+    assert HumanEval111.histogram("r t g") == %{"r" => 1,"t" => 1,"g" => 1}
+        
+    # Check some edge cases that are easy to work out by hand.
+    assert HumanEval111.histogram("") == %{}
+    assert HumanEval111.histogram("a") == %{"a" => 1}
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/127"}) do
+    """
+    assert HumanEval127.intersection({1, 2}, {2, 3}) == "NO"
+    assert HumanEval127.intersection({-1, 1}, {0, 4}) == "NO"
+    assert HumanEval127.intersection({-3, -1}, {-5, 5}) == "YES"
+    assert HumanEval127.intersection({-2, 2}, {-4, 0}) == "YES"
+
+    # Check some edge cases that are easy to work out by hand.
+    assert HumanEval127.intersection({-11, 2}, {-1, -1}) == "NO"
+    assert HumanEval127.intersection({1, 2}, {3, 5}) == "NO"
+    assert HumanEval127.intersection({1, 2}, {1, 2}) == "NO"
+    assert HumanEval127.intersection({-2, -2}, {-3, -2}) == "NO"
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/148"}) do
+    """
+    # Check some simple cases
+    assert HumanEval148.bf("Jupiter", "Neptune") == {"Saturn", "Uranus"}
+    assert HumanEval148.bf("Earth", "Mercury") == {"Venus"}
+    assert HumanEval148.bf("Mercury", "Uranus") == {"Venus", "Earth", "Mars", "Jupiter", "Saturn"}
+    assert HumanEval148.bf("Neptune", "Venus") == {"Earth", "Mars", "Jupiter", "Saturn", "Uranus"}  
+
+    # Check some edge cases that are easy to work out by hand.
+    assert HumanEval148.bf("Earth", "Earth") == {}
+    assert HumanEval148.bf("Mars", "Earth") == {}
+    assert HumanEval148.bf("Jupiter", "Makemake") == {}
+    """
+  end
+
+  def test_assertions(%{"task_id" => "HumanEval/151"}) do
+    """
+    # Check some simple cases
+    assert HumanEval151.double_the_difference([]) == 0 
+    assert HumanEval151.double_the_difference([5, 4]) == 25 
+    assert HumanEval151.double_the_difference([0.1, 0.2, 0.3]) == 0 
+    assert HumanEval151.double_the_difference([-10, -20, -30]) == 0 
+
+    # Check some edge cases that are easy to work out by hand.
+    assert HumanEval151.double_the_difference([-1, -2, 8]) == 0
+    assert HumanEval151.double_the_difference([0.2, 3, 5]) == 34
+
+    lst = -99..100 |> Enum.filter(&(rem(&1, 2)!=0))
+    odd_sum = lst |> Enum.filter(&(&1 > 0)) |> Enum.map(&(&1**2)) |> Enum.sum()
+    assert HumanEval151.double_the_difference(lst) == odd_sum 
+    """
+  end
+
+  def test_assertions(task) do
+    task["test"]
+    |> String.split("def check(candidate):")
+    |> Enum.at(1)
+    |> String.replace("candidate(", "#{module_name(task)}.#{function_name(task)}(")
+    |> String.replace("'", "\"")
+    |> String.replace("    print\n", "")
+    |> replace_e_notation()
+    |> replace_tuples()
+    |> replace_is()
+    |> fix_asserts()
+
+    # |> Enum.filter(&(!String.starts_with?(&1, "\n    assert")))
+    # |> Enum.filter(&(!String.starts_with?(&1, "\n\n    # C")))
+  end
+
+  @doc ~s"""
+
+  ## Examples:
+
+  iex> HumanEval.replace_e_notation("bla 1e6 1.2e-3 2.2e2")
+  "bla 1.0e6 1.2e-3 2.2e2"
+  """
+  def replace_e_notation(str) do
+    regexp = ~r/( [0-9]+)(e[-]?\d+)/
+    str |> String.replace(regexp, "\\1.0\\2")
+  end
+
+  @doc ~s"""
+
+  ## Examples:
+
+  iex> HumanEval.replace_tuples("== (1, 2)")
+  "== {1, 2}"
+
+  iex> HumanEval.replace_tuples("== (1.0, 2.2)")
+  "== {1.0, 2.2}"
+
+  iex> HumanEval.replace_tuples("bla tuple([a, b]) bla tuple([c, d])")
+  "bla ([a, b]) bla ([c, d])"
+
+  iex> HumanEval.replace_tuples(~s{assert Bla.blo(9) == (4, 5), "(good)"})
+  "assert Bla.blo(9) == {4, 5}, \\"(good)\\""
+
+  iex> HumanEval.replace_tuples("assert Bla.blo(9) == (4,5)")
+  "assert Bla.blo(9) == {4,5}"
+
+  """
+  def replace_tuples(str) do
+    str
+    |> String.replace(~r/== \(([^\)]+),([^\)]+)\)/, "== {\\1,\\2}")
+    |> String.replace(~r/tuple\(/, "(")
+  end
+
+  @doc """
+
+  ## Examples:
+
+  iex> HumanEval.replace_is("assert bla is True")
+  "assert bla == True"
+
+  iex> HumanEval.replace_is("assert bla is False")
+  "assert bla == False"
+
+  """
+  def replace_is(str) do
+    str
+    |> String.replace("is True", "== True")
+    |> String.replace("is False", "== False")
+  end
+
+  @doc """
+
+  ## Examples:
+
+  iex> HumanEval.fix_asserts(~s{    assert a == b, "Bananas"})
+  "    assert a == b"
+
+  iex> HumanEval.fix_asserts(~s{  assert a == b})
+  "  assert a == b"
+
+  iex> HumanEval.fix_asserts(~s{    assert HumanEval77.iscube(1) == True, "First test error: " + str(HumanEval77.iscube(1))})
+  "    assert HumanEval77.iscube(1) == True"
+
+  iex> HumanEval.fix_asserts(~s{    assert HumanEval78.hex_key('a') == 1, "First test error: " + str(HumanEval78.hex_key("AB")))})
+  "    assert HumanEval78.hex_key('a') == 1"
+
+  iex> HumanEval.fix_asserts(~s{assert bla(blo) == [a, b, c]})
+  "assert bla(blo) == [a, b, c]"
+
+  iex> HumanEval.fix_asserts("assert bla([10]) == {10, 2}")
+  "assert bla([10]) == {10, 2}"
+
+  iex> HumanEval.fix_asserts("assert (bla([1, 2, 3])) == ([1, 2])")
+  "assert (bla([1, 2, 3])) == ([1, 2])"
+
+  iex> HumanEval.fix_asserts("assert (bla([1, 2, 3])) == ([1, 2])")
+  "assert (bla([1, 2, 3])) == ([1, 2])"
+
+  iex> HumanEval.fix_asserts(~s{assert bla(148, 412) == 16, "First test error: " + str(multiply(148, 12))})
+  "assert bla(148, 412) == 16"
+
+  iex> HumanEval.fix_asserts(~s{assert bla("Mary lamb", 4) == ["little"], "bla" <> str(bla("Mary", 4))})
+  "assert bla(\\"Mary lamb\\", 4) == [\\"little\\"]"
+
+  iex> HumanEval.fix_asserts(~s{assert True, "Hello"})
+  "assert True"
+
+  """
+  def fix_asserts(str) do
+    str
+    |> String.replace(~r/^(\s*assert .+ == [^{(\\[].*), .+$/m, "\\1")
+    |> String.replace(~r/^(\s*assert .+ == [a-zA-Z0-9]+), .+$/m, "\\1")
+    |> String.replace(~r/^(\s*assert True), .+$/m, "\\1")
+    |> String.replace(~r/^(\s*assert .+ == \[.*\]), .+$/m, "\\1")
+  end
 end
 ```
 
 ```elixir
-task = human_eval_tasks |> Enum.map(&HumanEval.function_head/1)
+lst = -99..100 |> Enum.filter(&(rem(&1, 2) != 0))
+
+odd_sum = lst |> Enum.filter(&(&1 > 0)) |> Enum.map(&(&1 ** 2)) |> Enum.sum()
 ```
 
 ```elixir
 elixir_eval_tasks = human_eval_tasks |> Enum.map(&HumanEval.to_elixir_task/1)
-
-Helper.show_tasks(elixir_eval_tasks)
 ```
 
 Let's do some sanity checking - all code should compile if we add two ends to it
 
 ```elixir
-compilable_elixir =
-  elixir_eval_tasks |> Enum.map(& &1.code_context_before) |> Enum.map(&(&1 <> "\n  end\nend\n"))
+elixir_eval_tasks
+|> Enum.each(fn task ->
+  Code.eval_string(
+    """
+    #{task.code_context_before}
+      end
+    end
 
-compilable_elixir
-|> Enum.with_index()
-|> Enum.each(fn
-  {elixir, i} ->
-    IO.puts(i)
-    Code.eval_string(elixir)
+    #{task.tests}
+    """,
+    [],
+    file: "Code.eval_string #{task.id}"
+  )
 end)
+```
+
+```elixir
+ElixirEval.save_tasks!(
+  elixir_eval_tasks,
+  Path.join(__DIR__, "files/elixir_benchmarks/human_eval.jsonl")
+)
+```
+
+## Testing
+
+Lowest level
+
+* Input: 
+  * EvalTask
+  * Sample
+    * task_id
+    * completion
+
+```elixir
+defmodule ElixirEval.Evaluator do
+  # TODO store the module name in the task definition
+  def module_name(task), do: task.id |> String.replace("/", "")
+
+  @doc """
+  Returns {:ok} or {:error, err}
+
+  TODO return the following things
+  Success
+  - how many assertions passed
+  - the time it took
+
+  Failure
+  - syntax error and message
+  - assertion error and message 
+  - any other unexpected error
+
+  Opts
+    - timeout in ms (default 500)
+  """
+  def eval_sample(task, sample_solution, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 500)
+
+    task =
+      Task.async(fn ->
+        try do
+          code = """
+            #{task.code_context_before}#{sample_solution}#{task.code_context_after}
+            #{task.tests}
+
+            # try do
+              #{ElixirEval.Evaluator.module_name(task)}Test.run_tests()
+            # rescue
+              # e -> 
+              # IO.puts("Runtime error " <> inspect(e))
+            # end
+          """
+
+          IO.puts(code)
+          Code.eval_string(code)
+          {:ok}
+        rescue
+          exception ->
+            {:error, exception}
+        end
+      end)
+
+    case Task.yield(task, timeout) do
+      nil ->
+        IO.puts("TIMEOUT ")
+        Task.shutdown(task, :brutal_kill)
+        {:error, :timeout}
+
+      {:ok, {:error, exception}} ->
+        {:error, exception}
+
+      {:ok, return} ->
+        return
+
+      {:exit, reason} ->
+        {:error, reason}
+    end
+
+    # rescue
+    #   exception -> {:error, exception}
+  end
+end
+```
+
+```elixir
+elixir_human_eval_tasks =
+  ElixirEval.load_tasks!(Path.join(__DIR__, "files/elixir_benchmarks/human_eval.jsonl"))
 ```
 
 ## Generate samples with GPT4
 
 ````elixir
-alias OpenaiEx.ChatCompletion
-alias OpenaiEx.ChatMessage
-alias OpenaiEx.MsgContent
+defmodule ElixirEval.GPT4 do
+  @default_opts [
+    samples_per_task: 1,
+    num_processes: 1,
+    prompt: """
+    Complete following Elixir program correctly.
+    Only respond with source code and no other explanation.
+    Do not repeat the code I gave you, just return the new code needed to complete the function and module.
 
-task = Enum.random(human_eval_tasks)
-
-prompt = """
-Translate this python code into Elixir.
-Place the Elixir function #{task["entry_point"]} in a module called Test01.
-Don't change the function signature. 
-No need to use typespecs.
-Only respond with the Elixir code. 
-Only use functions that actually exist in Elixir.
-Don't just assume something that exists in python will exist in Elixir.
-Important: Convert the python docstrings (the ones with the triple-quotes) into Elixir 
-Ignore the python imports.
-
-Here is an example of a successful conversion:
-
-Python prompt
-
-
-
-
-```python
-#{task["prompt"]}
-#{task["canonical_solution"]}
-```
-"""
-
-IO.puts(prompt)
-
-chat_req =
-  ChatCompletion.new(
+    ```elixir
+    <code>
+    ```
+    """,
     model: "gpt-4-1106-preview",
-    messages: [
-      ChatMessage.user(prompt)
-    ]
-  )
+    temperature: 0.3,
+    max_tokens: 256,
+    top_p: 0.95,
+    frequency_penalty: 0,
+    presence_penalty: 0,
+    stop: []
+  ]
 
-chat_response = openai |> ChatCompletion.create(chat_req)
+  @doc """
 
-Kino.Shorts.markdown("""
-#{chat_response["choices"] |> hd |> Map.get("message") |> Map.get("content")}
-""")
-````
+  Opts
+    samples_per_task: number of sample solutions to generate per task (default 1)
+    num_processes: number of concurrent processes to use (default 1)
 
-```elixir
-defmodule Test01 do
-  def encode(message) do
-    """
-    Write a function that takes a message, and encodes in such a way that it swaps case of all letters, replaces all vowels in
-    the message with the letter that appears 2 places ahead of that vowel in the english alphabet.
-    Assume only letters.
+    model: model to use, defaults to (default gpt-4-1106-preview)
+    temperature: temperature (default 0.3)
+    max_tokens: the maximum number of tokens to return (default 256)
+    top_p: controls nucleus sampling(default 0.95)
+    frequency_penalty: repeat penalty (default 0)
+    presence_penalty: penalty for tokens that already exist in output (default 0),
+    stop: list of stop words that end token generation (default [])
+    
+  """
+  def generate_samples(tasks, opts \\ []) do
+    opts = opts |> Keyword.validate!(@default_opts)
 
-    ## Examples
+    {samples_per_task, opts} = Keyword.pop!(opts, :samples_per_task)
 
-        iex> Test01.encode('test')
-        'TGST'
+    {num_processes, opts} = Keyword.pop!(opts, :num_processes)
+    {prompt_template, opts} = Keyword.pop!(opts, :prompt)
 
-        iex> Test01.encode('This is a message')
-        'tHKS KS C MGSSCGG'
-    """
+    Stream.flat_map(tasks, fn task ->
+      for i <- 0..(samples_per_task - 1), do: {task, i}
+    end)
+    |> Task.async_stream(
+      fn {task, i} ->
+        IO.puts("Task #{task.id}, sample #{i}")
+        {task.id, i, completion(build_prompt(prompt_template, task), opts)}
+      end,
+      max_concurrency: num_processes,
+      timeout: :infinity
+    )
+    |> Stream.map(fn {:ok, {task_id, i, completion}} ->
+      %ElixirEval.Sample{
+        task_id: task_id,
+        sample_id: i,
+        completion: completion
+      }
+    end)
+    |> Enum.to_list()
 
-    vowels = "aeiouAEIOU"
-    vowels_replace = for <<vowel <- vowels>>, into: %{}, do: {vowel, <<vowel + 2>>}
+    # requests = for i <- 1..samples_per_task,
+    #   task <- tasks do
+    #     {task, i, build_prompt(prompt_template, task)}    
+    #   end
+    # end
 
-    message
-    |> String.swapcase()
-    |> String.to_charlist()
-    |> Enum.map(&if vowels_replace[&1], do: vowels_replace[&1], else: &1)
-    |> List.to_string()
+    # IO.inspect(requests)
+  end
+
+  def openai do
+    System.fetch_env!("LB_OPENAI_API_KEY") |> OpenaiEx.new()
+  end
+
+  def completion(prompt, opts) do
+    chat_req =
+      OpenaiEx.ChatCompletion.new(
+        Keyword.put(opts, :messages, [OpenaiEx.ChatMessage.user(prompt)])
+      )
+
+    # IO.inspect(chat_req)
+    chat_response = openai() |> OpenaiEx.ChatCompletion.create(chat_req)
+    chat_response["choices"] |> hd |> Map.get("message") |> Map.get("content") |> process_output()
+  end
+
+  def build_prompt(prompt_template, task) do
+    String.replace(prompt_template, "<code>", task.code_context_before)
+  end
+
+  @doc """
+  Trims triple backticks    
+
+  Examples:
+
+  iex> ElixirEval.GPT4.process_output("abc")
+  "abc"
+
+  iex> ElixirEval.GPT4.process_output("```elixir\\n```")
+  ""
+  iex> ElixirEval.GPT4.process_output("```elixir\\nbla\\n```")
+  "bla"
+  """
+  def process_output(str) do
+    str |> String.split("\n") |> Enum.reject(&String.starts_with?(&1, "```")) |> Enum.join("\n")
   end
 end
 
-Test01.encode(~c"This is a message")
+# prompt = """
+# Translate this python code into Elixir.
+# Place the Elixir function #{task["entry_point"]} in a module called Test01.
+# Don't change the function signature. 
+# No need to use typespecs.
+# Only respond with the Elixir code. 
+# Only use functions that actually exist in Elixir.
+# Don't just assume something that exists in python will exist in Elixir.
+# Important: Convert the python docstrings (the ones with the triple-quotes) into Elixir 
+# Ignore the python imports.
+
+# Here is an example of a successful conversion:
+
+# Python prompt
+
+# chat_req =
+#   ChatCompletion.new(
+#     model: "gpt-4-1106-preview",
+#     messages: [
+#       ChatMessage.user(prompt)
+#     ]
+#   )
+
+# chat_response = openai |> ChatCompletion.create(chat_req)
+
+# Kino.Shorts.markdown("""
+# #{chat_response["choices"] |> hd |> Map.get("message") |> Map.get("content")}
+# """)
+````
+
+```elixir
+tasks = elixir_eval_tasks
+
+solution_samples =
+  ElixirEval.GPT4.generate_samples(tasks,
+    samples_per_task: 1,
+    num_processes: 30,
+    frequency_penalty: 1.1
+  )
 ```
 
-<!-- livebook:{"offset":16190,"stamp":{"token":"XCP.MeJgaQKsdxLrL1l3i_LqtW-8Kt2hA5lgAeP3d-oJovRPvpd11xt1ePnGbe3ByWzfcSeSb0hPptE_ND0g2qzDJ4MAi0YaSRNl7r7itNNkL2fyUmiZIDqQdMg","version":2}} -->
+```elixir
+ElixirEval.save_samples!(
+  solution_samples,
+  Path.join(__DIR__, "files/solution_samples/gpt4_default.jsonl")
+)
+```
+
+```elixir
+samples =
+  ElixirEval.load_samples!(Path.join(__DIR__, "files/solution_samples/gpt4_default.jsonl"))
+```
+
+```elixir
+samples
+|> Enum.map(fn sample ->
+  task = tasks |> Enum.find(&(&1.id == sample.task_id))
+
+  case ElixirEval.Evaluator.eval_sample(task, sample.completion) do
+    {:ok} -> :ok
+    {status, _} -> status
+  end
+end)
+|> Enum.frequencies()
+```
+
+````elixir
+solution_samples
+|> Enum.map(fn sample ->
+  IO.puts(sample.completion)
+
+  """
+  ### Task #{sample.task_id}, sample #{sample.sample_id}
+
+  ```elixir
+  #{sample.completion}
+  ```
+  """
+end)
+|> Enum.join()
+|> Kino.Shorts.markdown()
+````
+
+<!-- livebook:{"offset":35256,"stamp":{"token":"XCP.e-_PU5Tdr_i5QKIUgbdErdE--EDHpbV6XtfSx5MBv01vVXgu-9HEaAw_9Gx3y4BGCFbRKr9dt-OOYa5jQDDciWNe4nbmAUKzX9R9fes_YylckKXUvvnVpmQ","version":2}} -->
